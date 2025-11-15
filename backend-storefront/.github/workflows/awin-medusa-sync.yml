@@ -1,0 +1,128 @@
+name: AWIN ↔ Medusa Sync
+
+on:
+  schedule:
+    - cron: "0 2 * * *"  # Run daily at 02:00 UTC
+  workflow_dispatch:  # Allow manual trigger
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Create tmp directory
+        run: mkdir -p tmp
+
+      - name: Download AWIN CSV
+        run: curl -s -o tmp/awin.csv "https://secrets-shop.co.uk/awin.csv"
+
+      - name: Run sync script
+        env:
+          MEDUSA_BACKEND_URL: ${{ secrets.MEDUSA_BACKEND_URL }}
+          NEXT_PUBLIC_MEDUSA_PUBLISHABLE_KEY: ${{ secrets.NEXT_PUBLIC_MEDUSA_PUBLISHABLE_KEY }}
+        run: node scripts/awin-medusa-sync.mjs --out tmp
+
+      - name: Upload sync reports as artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: sync-reports
+          path: |
+            tmp/missing-awin-products.csv
+            tmp/medusa-only-products.csv
+            tmp/stock-mismatches.csv
+            tmp/loose-matches.csv
+            tmp/sync-summary.json
+          retention-days: 30
+
+      - name: Import missing AWIN products (if any)
+        if: steps.import-check.outputs.has-missing == 'true'
+        env:
+          MEDUSA_BACKEND_URL: ${{ secrets.MEDUSA_BACKEND_URL }}
+          MEDUSA_ADMIN_API_KEY: ${{ secrets.MEDUSA_ADMIN_API_KEY }}
+        run: |
+          if [ -f "tmp/missing-awin-products.csv" ] && [ -s "tmp/missing-awin-products.csv" ]; then
+            node scripts/import-missing-awin.mjs --csv tmp/missing-awin-products.csv --out tmp
+          fi
+
+      - name: Cleanup Medusa-only products
+        env:
+          MEDUSA_BACKEND_URL: ${{ secrets.MEDUSA_BACKEND_URL }}
+          MEDUSA_ADMIN_API_KEY: ${{ secrets.MEDUSA_ADMIN_API_KEY }}
+        run: |
+          if [ -f "tmp/medusa-only-products.csv" ] && [ -s "tmp/medusa-only-products.csv" ]; then
+            node scripts/cleanup-medusa-only.mjs --csv tmp/medusa-only-products.csv --out tmp
+          fi
+
+      - name: Reconcile stock
+        env:
+          MEDUSA_BACKEND_URL: ${{ secrets.MEDUSA_BACKEND_URL }}
+          MEDUSA_ADMIN_API_KEY: ${{ secrets.MEDUSA_ADMIN_API_KEY }}
+        run: |
+          if [ -f "tmp/stock-mismatches.csv" ] && [ -s "tmp/stock-mismatches.csv" ]; then
+            node scripts/reconcile-stock.mjs --csv tmp/stock-mismatches.csv --out tmp
+          fi
+
+      - name: Upload operation logs as artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: operation-logs
+          path: |
+            tmp/import-missing-awin-*.ndjson
+            tmp/cleanup-medusa-only-*.ndjson
+            tmp/reconcile-stock-*.ndjson
+            tmp/import-missing-awin-summary.json
+            tmp/cleanup-medusa-only-summary.json
+            tmp/reconcile-stock-summary.json
+          retention-days: 30
+
+      - name: Check for missing products
+        id: import-check
+        run: |
+          if [ -f "tmp/missing-awin-products.csv" ] && [ -s "tmp/missing-awin-products.csv" ]; then
+            echo "has-missing=true" >> $GITHUB_OUTPUT
+          else
+            echo "has-missing=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Prepare Slack notification
+        id: slack
+        run: |
+          set -euo pipefail
+          SUMMARY_FILE="tmp/sync-summary.json"
+          if [ ! -f "$SUMMARY_FILE" ]; then
+            echo "message=Sync failed: no summary" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          MISSING=$(jq -r '.totals.missing_in_medusa // 0' "$SUMMARY_FILE")
+          STOCK_ISSUES=$(jq -r '.totals.stock_issues // 0' "$SUMMARY_FILE")
+          MEDUSA_ONLY=$(jq -r '.totals.medusa_only // 0' "$SUMMARY_FILE")
+          MSG="🔍 AWIN ↔ Medusa Sync Report
+Missing in Medusa: $MISSING
+Medusa-only products: $MEDUSA_ONLY
+Stock mismatches: $STOCK_ISSUES"
+          echo "message=$MSG" >> $GITHUB_OUTPUT
+
+      - name: Send Slack notification
+        if: always()
+        uses: 8398a7/action-slack@v3
+        with:
+          status: ${{ job.status }}
+          channel: "#ecom-sync"
+          webhook_url: ${{ secrets.SLACK_WEBHOOK_URL }}
+          text: |
+            ${{ steps.slack.outputs.message }}
+            <https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}|View run>
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
